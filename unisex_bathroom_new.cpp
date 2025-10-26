@@ -9,7 +9,7 @@ using namespace std;
 struct Person {
     string name;
     char party; // 'D' or 'R'
-    int time;   // bathroom time
+    int time;   // bathroom time in seconds
 };
 
 class Bathroom {
@@ -46,27 +46,41 @@ public:
             current_party = '\0';
             cout << "Bathroom now empty.\n";
             cv.notify_all();
+        } else {
+            cv.notify_all();
         }
     }
 };
 
 class GatedBatchScheduler {
     Bathroom &bathroom;
-    queue<Person> demQ, repQ;
     mutex q_mtx;
     condition_variable q_cv;
     bool running = true;
     char last_served = '\0';
-    bool gate_open = false;
+    bool gate_open = true;
+
+    // Active queues for current batch
+    queue<Person> demQ, repQ;
+    // Pending queues for next batch
+    queue<Person> dem_pending, rep_pending;
 
 public:
     GatedBatchScheduler(Bathroom &b) : bathroom(b) {}
 
+    // Non-blocking addPerson — respects the gate
     void addPerson(const Person &p) {
         {
             lock_guard<mutex> lock(q_mtx);
-            if (p.party == 'D') demQ.push(p);
-            else repQ.push(p);
+            if (gate_open) {
+                if (p.party == 'D') demQ.push(p);
+                else repQ.push(p);
+                cout << "[ARRIVAL] " << p.name << " (" << p.party << ") added to ACTIVE queue\n";
+            } else {
+                if (p.party == 'D') dem_pending.push(p);
+                else rep_pending.push(p);
+                cout << "[ARRIVAL] " << p.name << " (" << p.party << ") added to PENDING queue\n";
+            }
         }
         q_cv.notify_all();
     }
@@ -83,7 +97,7 @@ public:
 
             {
                 unique_lock<mutex> lock(q_mtx);
-                // Wait until we have at least one person waiting
+                // Wait until we have people to serve
                 q_cv.wait(lock, [&]() { return !demQ.empty() || !repQ.empty() || !running; });
                 if (!running) break;
 
@@ -94,20 +108,21 @@ public:
                 else if (last_served == 'R') next_party = 'D';
                 else next_party = 'D'; // default start
 
-                // Gate opens: form a batch with *currently waiting* people only
-                gate_open = true;
+                // Gate closes — new arrivals deferred
+                gate_open = false;
+                cout << "\n=== GATE CLOSED for party " << next_party << " ===\n";
+
                 queue<Person> &q = (next_party == 'D') ? demQ : repQ;
 
                 for (int i = 0; i < 3 && !q.empty(); ++i) {
                     batch.push_back(q.front());
                     q.pop();
                 }
-                gate_open = false;
                 last_served = next_party;
             }
 
-            // Run the batch (simulate bathroom usage)
-            cout << "\n--- Starting batch for party " << last_served << " ---\n";
+            // --- Process batch outside lock ---
+            cout << "--- Starting batch for party " << last_served << " ---\n";
             vector<thread> workers;
             for (auto &p : batch) {
                 workers.emplace_back([this, p]() {
@@ -119,6 +134,25 @@ public:
 
             for (auto &t : workers) t.join();
             cout << "--- Batch for party " << last_served << " finished ---\n";
+
+            // --- Batch finished, move pending to active ---
+            {
+                lock_guard<mutex> lock(q_mtx);
+                if (!dem_pending.empty() || !rep_pending.empty()) {
+                    while (!dem_pending.empty()) {
+                        demQ.push(dem_pending.front());
+                        dem_pending.pop();
+                    }
+                    while (!rep_pending.empty()) {
+                        repQ.push(rep_pending.front());
+                        rep_pending.pop();
+                    }
+                }
+
+                gate_open = true;
+                cout << "=== GATE OPEN for new arrivals ===\n";
+            }
+            q_cv.notify_all();
         }
     }
 };
@@ -130,19 +164,18 @@ int main() {
 
     vector<Person> arrivals = {
         {"D1",'D',3}, {"D2",'D',4}, {"R1",'R',5},
-        {"R2",'R',3}, {"D3",'D',2}, {"D4",'D',6}, {"R3",'R',4}
+        {"R2",'R',3}, {"D3",'D',2}, {"D4",'D',6}, {"R3",'R',4}, {"R4",'R',3}
     };
 
     thread sched_thread(&GatedBatchScheduler::schedule, &scheduler);
 
     // Simulate random arrival intervals (people queueing over time)
     for (auto &p : arrivals) {
-        this_thread::sleep_for(chrono::milliseconds(200));
+        this_thread::sleep_for(chrono::milliseconds(250));
         scheduler.addPerson(p);
-        cout << "[ARRIVAL] " << p.name << " (" << p.party << ")\n";
     }
 
-    // Allow time for all to complete
+    // Allow all to complete
     this_thread::sleep_for(chrono::seconds(40));
     scheduler.stop();
 
