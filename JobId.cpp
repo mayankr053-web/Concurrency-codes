@@ -6,52 +6,46 @@
 using namespace std;
 
 //
-// ---------- Thread-Safe Queue with built-in finish handling ----------
+// ---------- Simple Thread-Safe Queue ----------
 //
 template <typename T>
 class ConcurrentQueue {
     queue<T> q;
     mutable mutex m;
     condition_variable cv;
-    atomic<bool> finished = false;
+    bool finished = false;
 
 public:
-    // Push a new value into the queue
     void push(T value) {
         {
-            lock_guard<mutex> lock(m);
+            lock_guard lock(m);
+            if (finished) return;
             q.push(std::move(value));
         }
         cv.notify_one();
     }
 
-    // Pop waits until an item is available or finished is set
     bool pop(T &value) {
-        unique_lock<mutex> lock(m);
-        cv.wait(lock, [&]() { return !q.empty() || finished.load(); });
+        unique_lock lock(m);
+        cv.wait(lock, [&]() { return !q.empty() || finished; });
 
-        if (finished && q.empty())
-            return false;  // stop gracefully
-
+        if (finished && q.empty()) return false;
         value = std::move(q.front());
         q.pop();
         return true;
     }
 
-    // Called by main thread when no more items will be added
     void set_finished() {
-        finished = true;
-        cv.notify_all();  // wake up all waiting threads
-    }
-
-    bool empty() const {
-        lock_guard<mutex> lock(m);
-        return q.empty();
+        {
+            lock_guard lock(m);
+            finished = true;
+        }
+        cv.notify_all();
     }
 };
 
 //
-// ---------- Job + Pipeline Manager ----------
+// ---------- Job & Pipeline ----------
 //
 struct Job {
     int jobId;
@@ -60,15 +54,17 @@ struct Job {
 
 class PipelineManager {
     vector<Job> jobs;
-    unordered_map<int, vector<int>> adj;   // job -> dependents
-    unordered_map<int, int> indegree;      // job -> dependency count
+    unordered_map<int, vector<int>> adj;
+    unordered_map<int, int> indegree;
     unordered_map<int, Job*> jobMap;
-    ConcurrentQueue<int> ready;            // ready jobs
+    ConcurrentQueue<int> ready;
     atomic<int> done = 0;
     int total = 0;
-    mutex indegreeMutex;
-    condition_variable cv_done;
-    mutex doneMutex;
+
+    mutex m;
+    condition_variable cv;
+    exception_ptr exceptionPtr = nullptr;
+    atomic<bool> stopAll = false;
 
 public:
     PipelineManager(const vector<Job>& jobs, const vector<pair<int,int>>& deps)
@@ -77,69 +73,69 @@ public:
         for (auto &j : this->jobs)
             jobMap[j.jobId] = &j;
 
-        // Build dependency graph
-        for (auto &e : deps) {
-            adj[e.first].push_back(e.second);
-            indegree[e.second]++;
-        }
+        for (auto &[u, v] : deps)
+            indegree[v]++, adj[u].push_back(v);
 
-        // Push jobs with no dependencies
         for (auto &j : this->jobs)
-            if (indegree[j.jobId] == 0)
+            if (!indegree[j.jobId])
                 ready.push(j.jobId);
 
         total = jobs.size();
     }
 
     void execute() {
-        int nThreads = thread::hardware_concurrency();
-        if (nThreads == 0) nThreads = 4;
-
+        int n = max(2u, thread::hardware_concurrency());
         vector<thread> workers;
-        for (int i = 0; i < nThreads; ++i)
+        for (int i = 0; i < n; ++i)
             workers.emplace_back(&PipelineManager::worker, this);
 
-        // Wait until all jobs are done
         {
-            unique_lock<mutex> lock(doneMutex);
-            cv_done.wait(lock, [&]() { return done.load() >= total; });
+            unique_lock lock(m);
+            cv.wait(lock, [&]() { return done == total || stopAll; });
         }
 
-        // Mark the queue as finished so workers can exit
         ready.set_finished();
+        for (auto &t : workers) t.join();
 
-        for (auto &t : workers)
-            t.join();
-
-        cout << "Pipeline completed successfully!\n";
+        if (exceptionPtr) {
+            try { rethrow_exception(exceptionPtr); }
+            catch (const exception &e) { cerr << "❌ Exception: " << e.what() << endl; }
+        } else {
+            cout << "✅ Pipeline completed successfully!\n";
+        }
     }
 
 private:
     void worker() {
-        while (true) {
+        while (!stopAll) {
             int jobId;
-            if (!ready.pop(jobId)) // queue finished & empty
-                return;
+            if (!ready.pop(jobId)) return;
 
-            // Execute job
-            Job* job = jobMap[jobId];
-            job->doWork();
-
-            int finishedCount = ++done;
-            if (finishedCount == total) {
-                unique_lock<mutex> lock(doneMutex);
-                cv_done.notify_all();
-            }
-
-            // Unlock dependents safely
-            {
-                lock_guard<mutex> lock(indegreeMutex);
-                for (int dep : adj[jobId]) {
-                    indegree[dep]--;
-                    if (indegree[dep] == 0)
-                        ready.push(dep);
+            try {
+                jobMap[jobId]->doWork();
+                int finished = ++done;
+                if (finished == total) {
+                    cv.notify_all();
+                    return;
                 }
+
+                lock_guard lock(m);
+                for (int dep : adj[jobId])
+                    if (--indegree[dep] == 0)
+                        ready.push(dep);
             }
+            catch (...) {
+                handle_exception();
+                return;
+            }
+        }
+    }
+
+    void handle_exception() {
+        if (!stopAll.exchange(true)) { // first error
+            exceptionPtr = current_exception();
+            ready.set_finished();
+            cv.notify_all();
         }
     }
 };
@@ -149,15 +145,17 @@ private:
 //
 int main() {
     vector<Job> jobs = {
-        {1, [](){ cout << "Job 1 executed\n"; }},
-        {2, [](){ cout << "Job 2 executed\n"; }},
-        {3, [](){ cout << "Job 3 executed\n"; }},
-        {4, [](){ cout << "Job 4 executed\n"; }},
+        {1, [] { cout << "Job 1 executed\n"; }},
+        {2, [] { cout << "Job 2 executed\n"; }},
+        {3, [] {
+            cout << "Job 3 failed!\n";
+            throw runtime_error("Error in Job 3");
+        }},
+        {4, [] { cout << "Job 4 executed\n"; }},
     };
 
-    // Dependencies: 1 -> 2, 1 -> 3, 2 -> 4, 3 -> 4
     vector<pair<int,int>> deps = {
-        {1, 2}, {1, 3}, {2, 4}, {3, 4}
+        {1,2}, {1,3}, {2,4}, {3,4}
     };
 
     PipelineManager pm(jobs, deps);
